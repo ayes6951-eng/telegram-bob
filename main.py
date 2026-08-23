@@ -1,53 +1,78 @@
 import asyncio
-import sqlite3
+import json
+import os
 from pyrogram import Client, filters
 from pyrogram.enums import ChatAction
 from pyrogram.errors import FloodWait, RPCError
+from pyrogram import idle
 
-# --- Configuration ---
-API_ID = 32593259
-API_HASH = "248f3abd799b6e88bbfe44332e3f09b2"
-SESSION_NAME = "okgy"
-MAX_TARGETS = 10    # လူအများဆုံး ၁၀ ယောက်အထိ
-DEFAULT_DELAY = 1.0 # Spam Loop လုပ်မည့် အမြန်နှုန်း (စက္ကန့်)
+# --- Configuration (Environment Variables မှ ယူခြင်း) ---
+API_ID = int(os.environ.get("API_ID", 32593259))
+API_HASH = os.environ.get("API_HASH", "248f3abd799b6e88bbfe44332e3f09b2")
+SESSION_STRING = os.environ.get("SESSION_STRING")
 
-class Database:
-    def __init__(self):
-        self.conn = sqlite3.connect('userbot_data.db', check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.init_tables()
-    
-    def init_tables(self):
-        self.cursor.execute('CREATE TABLE IF NOT EXISTS replies_list (id INTEGER PRIMARY KEY AUTOINCREMENT, reply_text TEXT)')
-        self.conn.commit()
+MAX_TARGETS = 10    
+DEFAULT_DELAY = 1.0 
+
+# JSON Database
+DB_FILE = "replies_db.json"
+
+class JSONDatabase:
+    def __init__(self, filename=DB_FILE):
+        self.filename = filename
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', encoding='utf-8') as f:
+                json.dump([], f)
+
+    def _read_data(self):
+        try:
+            with open(self.filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _write_data(self, data):
+        with open(self.filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     def add_reply(self, text):
-        self.cursor.execute("INSERT INTO replies_list (reply_text) VALUES (?)", (text,))
-        self.conn.commit()
-        return self.cursor.lastrowid
+        data = self._read_data()
+        new_id = (data[-1]['id'] + 1) if data else 1
+        data.append({"id": new_id, "text": text})
+        self._write_data(data)
+        return new_id
 
     def del_reply(self, reply_id):
-        self.cursor.execute("DELETE FROM replies_list WHERE id = ?", (reply_id,))
-        self.conn.commit()
-        return self.cursor.rowcount > 0
+        data = self._read_data()
+        initial_len = len(data)
+        data = [r for r in data if r['id'] != reply_id]
+        if len(data) < initial_len:
+            self._write_data(data)
+            return True
+        return False
 
     def get_all_replies(self):
-        self.cursor.execute("SELECT id, reply_text FROM replies_list ORDER BY id ASC")
-        return self.cursor.fetchall()
+        data = self._read_data()
+        return [(r['id'], r['text']) for r in data]
 
-db = Database()
-app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+db = JSONDatabase()
 
-target_users = {}         # Target တွေ သိမ်းရန်
-active_spam_tasks = {}    # "ဟာဘရို" Spam Loop အတွက် Task များ
-auto_reply_chats = set()  # "လီးလား" Auto Reply အတွက် Chat များ
-chat_delays = {}          # Spam Delay သိမ်းရန်
-current_index = {}        # စာစဉ်လိုက် ပို့ရန် Index
+app = Client(
+    "my_userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
 
-# 🚀 1. "ဟာဘရို" အတွက် Target ဘက်က စာမပို့လည်း MT ခေါ်ပြီး ဆက်တိုက် Spam မည့် Loop Function
+target_users = {}         
+active_spam_tasks = {}    
+auto_reply_chats = set()  
+chat_delays = {}          
+current_index = {}        
+
+# 🚀 1. "ဟာဘရို" Spam Loop
 async def spam_loop(chat_id):
     current_delay = chat_delays.get(chat_id, DEFAULT_DELAY)
-    print(f"[{chat_id}] Spam Loop စတင်နေပါပြီ (Delay: {current_delay}s)...")
     
     while chat_id in active_spam_tasks:
         try:
@@ -55,10 +80,8 @@ async def spam_loop(chat_id):
             replies = [r[1] for r in all_data]
             
             if not replies:
-                try:
-                    await app.send_message("me", "❌ **Spam ရပ်သွားပါပြီ။ Database ထဲတွင် စာမရှိတော့ပါ။**")
-                except Exception:
-                    pass
+                try: await app.send_message("me", "❌ **Spam ရပ်သွားပါပြီ။ Database ထဲတွင် စာမရှိတော့ပါ။**")
+                except Exception: pass
                 break
             
             if chat_id not in current_index:
@@ -68,7 +91,6 @@ async def spam_loop(chat_id):
             if not targets:
                 break
             
-            # Username ရှိ/မရှိ စစ်ဆေးပြီး Mention (MT) တည်ဆောက်ခြင်း
             mentions_list = []
             for user in list(targets):
                 if user.username:
@@ -77,14 +99,11 @@ async def spam_loop(chat_id):
                     mentions_list.append(f"[{user.first_name}](tg://user?id={user.id})")
             
             all_mentions_text = " ".join(mentions_list)
-            
             idx = current_index[chat_id] % len(replies)
             reply = replies[idx]
             final_text = f"{all_mentions_text} {reply}"
             
-            # Target ဘက်က စာပို့စရာမလိုဘဲ MT နဲ့ စာကို ပုံမှန် ပို့မည် (Spamming)
             await app.send_message(chat_id, final_text)
-            
             current_index[chat_id] = idx + 1
             await asyncio.sleep(current_delay)
                 
@@ -93,21 +112,17 @@ async def spam_loop(chat_id):
         except (RPCError, Exception):
             await asyncio.sleep(1)
 
-# 🔄 2. "လီးလား" အတွက် Target စာပို့မှ MT မပါဘဲ Reply ပြန်မည့် Handler
+# 🔄 2. "လီးလား" Auto Reply Handler
 @app.on_message(filters.group & ~filters.me)
 async def auto_reply_handler(client, message):
     chat_id = message.chat.id
-    
     if chat_id in auto_reply_chats and chat_id in target_users:
         target_ids = [u.id for u in target_users[chat_id]]
-        
         if message.from_user and message.from_user.id in target_ids:
             try:
                 all_data = db.get_all_replies()
                 replies = [r[1] for r in all_data]
-                
-                if not replies:
-                    return
+                if not replies: return
 
                 if chat_id not in current_index:
                     current_index[chat_id] = 0
@@ -116,30 +131,27 @@ async def auto_reply_handler(client, message):
                 reply = replies[idx]
                 current_index[chat_id] = idx + 1
 
-                # MT လုံးဝမပါဘဲ Target စာကို တိုက်ရိုက် Reply ပြန်ခြင်း
                 await message.reply_text(reply)
-
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-            except (RPCError, Exception) as e:
+            except Exception as e:
                 print(f"Auto Reply Error: {e}")
 
-# 🎮 Command များ ထိန်းချုပ်သည့် စနစ်
+# 🎮 Command Handler
 @app.on_message(filters.me & filters.text)
 async def handle_commands(client, message):
     chat_id = message.chat.id
     text = message.text.strip()
 
     try:
-        # 1. Help Menu 📖
         if text == "/help":
             delay_val = chat_delays.get(chat_id, DEFAULT_DELAY)
             help_msg = (
                 f"📌 **Ultimate Bot Menu**\n\n"
-                f"🔹 `ဟာဘရို` - Target ကို Reply ပြန်ပြီး **MT ခေါ်ကာ သူ့ဟာသူ Auto Spam Loop** စတင်ရန် 🚀\n"
-                f"🔹 `လီးလား` - Target ကို Reply ပြန်ပြီး **MT မပါဘဲ Target စာပို့မှ Reply** ပြန်ရန် 🔄\n"
-                f"🔹 `အိုကေဘရို` - အလုပ်လုပ်နေတာတွေ အကုန်ရပ်ရန် 🛑\n"
-                f"🔹 `/delay [0.1-10]` - Spam ရဲ့ အမြန်နှုန်းချိန်ရန်\n"
+                f"🔹 `ဟာဘရို` - Auto Spam Loop 🚀\n"
+                f"🔹 `လီးလား` - Auto Reply 🔄\n"
+                f"🔹 `အိုကေဘရို` - ရပ်ရန် 🛑\n"
+                f"🔹 `/delay [0.1-10]` - အမြန်နှုန်းချိန်ရန်\n"
                 f"🔹 `/add_reply [စာ]` - စာတစ်ကြောင်းချင်းထည့်\n"
                 f"🔹 `/add_multi [စာသားများ]` - စာအများကြီးတစ်ခါတည်းထည့်\n"
                 f"🔹 `/del_reply [ID]` - စာဖျက်\n"
@@ -149,9 +161,7 @@ async def handle_commands(client, message):
             await client.send_message("me", help_msg)
             try: await message.delete() 
             except Exception: pass
-            return
 
-        # 2. Delay ချိန်ညှိခြင်း ⏱
         elif text.startswith("/delay"):
             parts = text.split(None, 1)
             if len(parts) >= 2:
@@ -165,13 +175,10 @@ async def handle_commands(client, message):
                             active_spam_tasks[chat_id] = asyncio.create_task(spam_loop(chat_id))
                     else:
                         await client.send_message("me", "⚠️ **0.1 မှ 10 စက္ကန့်အတွင်းသာ ချိန်ပါ။**")
-                except ValueError:
-                    pass
+                except ValueError: pass
             try: await message.delete()
             except Exception: pass
-            return
 
-        # 3. Add Reply 🛠️
         elif text.startswith("/add_reply"):
             parts = text.split(None, 1)
             if len(parts) >= 2:
@@ -179,9 +186,7 @@ async def handle_commands(client, message):
                 await client.send_message("me", f"✅ **ID {new_id} အဖြစ် သိမ်းဆည်းပြီးပါပြီ**")
             try: await message.delete()
             except Exception: pass
-            return
 
-        # 4. Add Multi Reply 🚀
         elif text.startswith("/add_multi"):
             parts = text.split(None, 1)
             if len(parts) >= 2:
@@ -195,9 +200,7 @@ async def handle_commands(client, message):
                     await client.send_message("me", f"🚀 **စာသား {len(lines)} ခု (ID {start_id} မှ {end_id}) သိမ်းပြီးပါပြီ။**")
             try: await message.delete()
             except Exception: pass
-            return
 
-        # 5. Delete Reply 🗑️
         elif text.startswith("/del_reply"):
             parts = text.split(None, 1)
             if len(parts) >= 2:
@@ -212,10 +215,8 @@ async def handle_commands(client, message):
                     await client.send_message("me", "⚠️ **မှန်ကန်သော ID ထည့်ပါ။**")
             try: await message.delete()
             except Exception: pass
-            return
 
-        # 6. List Reply 📑
-        elif text == "list_reply" or text == "/list_reply":
+        elif text in ["list_reply", "/list_reply"]:
             replies = db.get_all_replies()
             if not replies:
                 await client.send_message("me", "❌ Database ထဲတွင် စာမရှိသေးပါ")
@@ -229,20 +230,15 @@ async def handle_commands(client, message):
                     await asyncio.sleep(0.3)
             try: await message.delete()
             except Exception: pass
-            return
 
-        # 7. Start Spam Loop (`ဟာဘရို`) 🚀
         elif text == "ဟာဘရို" and message.reply_to_message:
             target = message.reply_to_message.from_user
-            if chat_id not in target_users: 
-                target_users[chat_id] = []
-                
-            if len(target_users[chat_id]) >= MAX_TARGETS:
-                if target.id not in [u.id for u in target_users[chat_id]]:
-                    await client.send_message("me", f"⚠️ **Target ပြည့်သွားပါပြီ။**")
-                    try: await message.delete()
-                    except Exception: pass
-                    return
+            if chat_id not in target_users: target_users[chat_id] = []
+            if len(target_users[chat_id]) >= MAX_TARGETS and target.id not in [u.id for u in target_users[chat_id]]:
+                await client.send_message("me", "⚠️ **Target ပြည့်သွားပါပြီ။**")
+                try: await message.delete()
+                except Exception: pass
+                return
 
             if target.id not in [u.id for u in target_users[chat_id]]:
                 target_users[chat_id].append(target)
@@ -252,27 +248,18 @@ async def handle_commands(client, message):
             try: await message.delete() 
             except Exception: pass
             
-            # "လီးလား" mode ကို ပိတ်ပြီး Spam loop ကို စတင်မည်
-            if chat_id in auto_reply_chats:
-                auto_reply_chats.remove(chat_id)
-
-            if chat_id in active_spam_tasks:
-                active_spam_tasks[chat_id].cancel()
-                
+            if chat_id in auto_reply_chats: auto_reply_chats.remove(chat_id)
+            if chat_id in active_spam_tasks: active_spam_tasks[chat_id].cancel()
             active_spam_tasks[chat_id] = asyncio.create_task(spam_loop(chat_id))
 
-        # 8. Start Auto Reply (`လီးလား`) 🔄
         elif text == "လီးလား" and message.reply_to_message:
             target = message.reply_to_message.from_user
-            if chat_id not in target_users: 
-                target_users[chat_id] = []
-                
-            if len(target_users[chat_id]) >= MAX_TARGETS:
-                if target.id not in [u.id for u in target_users[chat_id]]:
-                    await client.send_message("me", f"⚠️ **Target ပြည့်သွားပါပြီ။**")
-                    try: await message.delete()
-                    except Exception: pass
-                    return
+            if chat_id not in target_users: target_users[chat_id] = []
+            if len(target_users[chat_id]) >= MAX_TARGETS and target.id not in [u.id for u in target_users[chat_id]]:
+                await client.send_message("me", "⚠️ **Target ပြည့်သွားပါပြီ။**")
+                try: await message.delete()
+                except Exception: pass
+                return
 
             if target.id not in [u.id for u in target_users[chat_id]]:
                 target_users[chat_id].append(target)
@@ -282,33 +269,34 @@ async def handle_commands(client, message):
             try: await message.delete() 
             except Exception: pass
             
-            # "ဟာဘရို" Spam loop ကို ရပ်မည်
             if chat_id in active_spam_tasks:
                 active_spam_tasks[chat_id].cancel()
                 del active_spam_tasks[chat_id]
-
             auto_reply_chats.add(chat_id)
 
-        # 9. Stop All (`အိုကေဘရို`) 🛑
         elif text == "အိုကေဘရို":
             if chat_id in active_spam_tasks:
                 active_spam_tasks[chat_id].cancel()
                 del active_spam_tasks[chat_id]
-            if chat_id in auto_reply_chats:
-                auto_reply_chats.remove(chat_id)
-            if chat_id in target_users:
-                target_users[chat_id] = []
-            if chat_id in current_index:
-                del current_index[chat_id]
+            if chat_id in auto_reply_chats: auto_reply_chats.remove(chat_id)
+            if chat_id in target_users: target_users[chat_id] = []
+            if chat_id in current_index: del current_index[chat_id]
                 
             await client.send_message("me", "🔔 **စနစ်အားလုံးကို ရပ်လိုက်ပါပြီ**")
             try: await message.delete() 
             except Exception: pass
-            
+
     except Exception as e:
         print(f"Command Error: {e}")
 
+# Cloud မဂ်လာ မရပ်သွားစေရန် Asyncio Loop စနစ်ဖြင့် မောင်းနှင်ခြင်း
+async def start_main():
+    await app.start()
+    print("Bot 🚀 Render Cloud ပေါ်တွင် စတင်အလုပ်လုပ်နေပါပြီ...")
+    await idle()
+    await app.stop()
+
 if __name__ == "__main__":
-    print("Bot ကို စတင်မောင်းနှင်နေပါပြီ...")
-    app.run()
-        
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(start_main())
+    
